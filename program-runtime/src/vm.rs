@@ -285,6 +285,10 @@ pub fn execute<'a, 'b: 'a>(
             execution_mode = ExecutionMode::Interpreted;
         }
 
+        if invoke_context.cu_profiler.is_some() {
+            execution_mode = ExecutionMode::Interpreted;
+        }
+
         let compute_meter_prev = invoke_context.get_remaining();
         let (mut vm, stack, heap) = unsafe {
             // SAFETY: The `stack`, `heap` and `executable` live past the lifetime of
@@ -313,8 +317,14 @@ pub fn execute<'a, 'b: 'a>(
         vm.registers[2] = instruction_data_offset as u64;
         let mut call_frames =
             MEMORY_POOL.with_borrow_mut(|memory_pool| memory_pool.get_call_frames());
+        if let Some(profiler) = vm.context().cu_profiler.as_mut() {
+            profiler.on_program_enter(program_id.to_bytes());
+        }
         let (compute_units_consumed, result) =
             vm.execute_program(executable, &mut execution_mode, &mut call_frames);
+        if let Some(profiler) = vm.context().cu_profiler.as_mut() {
+            profiler.on_program_exit();
+        }
         let register_trace = std::mem::take(&mut vm.register_trace);
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);

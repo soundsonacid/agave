@@ -29,6 +29,7 @@ use {
         elf::{ElfError, Executable as GenericExecutable},
         error::{EbpfError, ProgramResult},
         memory_region::MemoryMapping,
+        profiler::CuProfiler,
         program::{BuiltinProgram, SBPFVersion},
         vm::{Config, ContextObject, EbpfVm},
     },
@@ -119,6 +120,36 @@ impl ContextObject for InvokeContext<'_, '_> {
             .memory_mapping_mut()
             .expect("The memory context must have been set for the current instruction");
         ptr::NonNull::from_mut(memory)
+    }
+
+    fn on_instruction(&mut self, pc: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_instruction(pc);
+        }
+    }
+
+    fn on_call(&mut self, callsite_pc: u64, target_pc: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_call(callsite_pc, target_pc);
+        }
+    }
+
+    fn on_return(&mut self) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_return();
+        }
+    }
+
+    fn on_syscall_enter(&mut self, callsite_pc: u64, key: u32) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_syscall_enter(callsite_pc, key);
+        }
+    }
+
+    fn on_syscall_exit(&mut self, cost: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_syscall_exit(cost);
+        }
     }
 }
 
@@ -242,6 +273,7 @@ pub struct InvokeContext<'a, 'ix_data> {
     /// Debug port to use for this executing transaction.
     #[cfg(feature = "sbpf-debugger")]
     pub debug_port: Option<u16>,
+    pub cu_profiler: Option<CuProfiler>,
 }
 
 impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
@@ -267,8 +299,32 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             register_traces: Vec::new(),
             #[cfg(feature = "sbpf-debugger")]
             debug_port: None,
+            cu_profiler: None,
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_profiler(
+        transaction_context: &'a mut TransactionContext<'ix_data>,
+        program_cache_for_tx_batch: &'a mut ProgramCacheForTxBatch,
+        environment_config: EnvironmentConfig<'a>,
+        log_collector: Option<Rc<RefCell<LogCollector>>>,
+        compute_budget: SVMTransactionExecutionBudget,
+        execution_cost: SVMTransactionExecutionCost,
+        profiler: CuProfiler,
+    ) -> Self {
+        let mut this = Self::new(
+            transaction_context,
+            program_cache_for_tx_batch,
+            environment_config,
+            log_collector,
+            compute_budget,
+            execution_cost,
+        );
+        this.cu_profiler = Some(profiler);
+        this
+    }
+
 
     /// Push a stack frame onto the invocation stack
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
