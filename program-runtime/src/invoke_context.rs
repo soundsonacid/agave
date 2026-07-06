@@ -18,6 +18,7 @@ use {
         ebpf::MM_HEAP_START,
         error::{EbpfError, ProgramResult},
         memory_region::MemoryMapping,
+        profiler::CuProfiler,
         program::{BuiltinFunction, SBPFVersion},
         vm::{Config, ContextObject, EbpfVm},
     },
@@ -103,6 +104,36 @@ impl ContextObject for InvokeContext<'_> {
 
     fn get_remaining(&self) -> u64 {
         *self.compute_meter.borrow()
+    }
+
+    fn on_instruction(&mut self, pc: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_instruction(pc);
+        }
+    }
+
+    fn on_call(&mut self, callsite_pc: u64, target_pc: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_call(callsite_pc, target_pc);
+        }
+    }
+
+    fn on_return(&mut self) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_return();
+        }
+    }
+
+    fn on_syscall_enter(&mut self, callsite_pc: u64, key: u32) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_syscall_enter(callsite_pc, key);
+        }
+    }
+
+    fn on_syscall_exit(&mut self, cost: u64) {
+        if let Some(profiler) = self.cu_profiler.as_mut() {
+            profiler.on_syscall_exit(cost);
+        }
     }
 }
 
@@ -205,6 +236,7 @@ pub struct InvokeContext<'a> {
     traces: Vec<Vec<[u64; 12]>>,
     /// Stops copying account data if stricter_abi_and_runtime_constraints is enabled
     pub account_data_direct_mapping: bool,
+    pub cu_profiler: Option<CuProfiler>,
 }
 
 impl<'a> InvokeContext<'a> {
@@ -230,7 +262,30 @@ impl<'a> InvokeContext<'a> {
             syscall_context: Vec::new(),
             traces: Vec::new(),
             account_data_direct_mapping: false,
+            cu_profiler: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_profiler(
+        transaction_context: &'a mut TransactionContext,
+        program_cache_for_tx_batch: &'a mut ProgramCacheForTxBatch,
+        environment_config: EnvironmentConfig<'a>,
+        log_collector: Option<Rc<RefCell<LogCollector>>>,
+        compute_budget: SVMTransactionExecutionBudget,
+        execution_cost: SVMTransactionExecutionCost,
+        profiler: CuProfiler,
+    ) -> Self {
+        let mut this = Self::new(
+            transaction_context,
+            program_cache_for_tx_batch,
+            environment_config,
+            log_collector,
+            compute_budget,
+            execution_cost,
+        );
+        this.cu_profiler = Some(profiler);
+        this
     }
 
     pub fn get_environments_for_slot(

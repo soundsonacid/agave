@@ -1508,7 +1508,17 @@ fn execute<'a, 'b: 'a>(
 
         vm.context_object_pointer.execute_time = Some(Measure::start("execute"));
         vm.registers[1] = ebpf::MM_INPUT_START;
+        if !use_jit {
+            if let Some(profiler) = vm.context_object_pointer.cu_profiler.as_mut() {
+                profiler.on_program_enter(program_id.to_bytes());
+            }
+        }
         let (compute_units_consumed, result) = vm.execute_program(executable, !use_jit);
+        if !use_jit {
+            if let Some(profiler) = vm.context_object_pointer.cu_profiler.as_mut() {
+                profiler.on_program_exit();
+            }
+        }
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);
             memory_pool.put_heap(heap);
