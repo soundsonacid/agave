@@ -16,6 +16,7 @@ use {
     solana_svm_type_overrides::sync::Arc,
     solana_sysvar_id::SysvarId,
     solana_transaction_context::{IndexOfAccount, instruction::InstructionContext},
+    std::collections::HashMap,
 };
 
 #[cfg(feature = "frozen-abi")]
@@ -48,6 +49,8 @@ pub struct SysvarCache {
     fees: Option<Fees>,
     #[expect(deprecated)]
     recent_blockhashes: Option<RecentBlockhashes>,
+
+    custom_sysvars: HashMap<Pubkey, Option<Vec<u8>>>,
 }
 
 // declare_deprecated_sysvar_id doesn't support const.
@@ -57,6 +60,21 @@ const RECENT_BLOCKHASHES_ID: Pubkey =
     Pubkey::from_str_const("SysvarRecentB1ockHashes11111111111111111111");
 
 impl SysvarCache {
+    /// Register an arbitrary sysvar. For testing purposes only.
+    pub fn register_custom_sysvar_data(&mut self, sysvar_id: Pubkey, data: Vec<u8>) {
+        self.custom_sysvars.insert(sysvar_id, Some(data));
+    }
+
+    /// Deregister an arbitrary sysvar. For testing purposes only.
+    pub fn deregister_custom_sysvar(&mut self, sysvar_id: &Pubkey) -> Option<Vec<u8>> {
+        self.custom_sysvars.remove(sysvar_id).flatten()
+    }
+
+    /// Get an arbitrary sysvar. For testing purposes only.
+    pub fn get_custom_sysvar(&self, sysvar_id: &Pubkey) -> &Option<Vec<u8>> {
+        self.custom_sysvars.get(sysvar_id).unwrap_or(&None)
+    }
+
     /// Overwrite a sysvar. For testing purposes only.
     #[expect(deprecated)]
     pub fn set_sysvar_for_tests<T: Serialize + SysvarId>(&mut self, sysvar: &T) {
@@ -121,7 +139,7 @@ impl SysvarCache {
         } else if LastRestartSlot::check_id(sysvar_id) {
             &self.last_restart_slot
         } else {
-            &None
+            self.get_custom_sysvar(sysvar_id)
         }
     }
 
