@@ -1,7 +1,10 @@
 #[expect(deprecated)]
 use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use {
-    crate::invoke_context::InvokeContext,
+    crate::{
+        invoke_context::InvokeContext,
+        leader_temp::{LEADER_INFO_ID, LeaderInfo},
+    },
     serde::{Serialize, de::DeserializeOwned},
     solana_clock::Clock,
     solana_epoch_rewards::EpochRewards,
@@ -28,6 +31,7 @@ pub struct SysvarCache {
     slot_hashes: Option<Vec<u8>>,
     stake_history: Option<Vec<u8>>,
     last_restart_slot: Option<Vec<u8>>,
+    leader_info: Option<Vec<u8>>,
 
     // object representations of large sysvars for convenience
     // these are used by the stake and vote builtin programs
@@ -92,8 +96,15 @@ impl SysvarCache {
                 self.stake_history = Some(data);
                 self.stake_history_obj = Some(Arc::new(stake_history));
             }
+            LEADER_INFO_ID => {
+                self.leader_info = Some(data);
+            }
             _ => panic!("Unrecognized Sysvar ID: {sysvar_id}"),
         }
+    }
+
+    pub fn set_leader_info(&mut self, data: Vec<u8>) {
+        self.leader_info = Some(data);
     }
 
     // this is exposed for SyscallGetSysvar and should not otherwise be used
@@ -112,6 +123,8 @@ impl SysvarCache {
             &self.stake_history
         } else if LastRestartSlot::check_id(sysvar_id) {
             &self.last_restart_slot
+        } else if LeaderInfo::check_id(sysvar_id) {
+            &self.leader_info
         } else {
             &None
         }

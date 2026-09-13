@@ -147,6 +147,7 @@ use {
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
         invoke_context::BuiltinFunctionRegisterer,
+        leader_temp::LeaderInfo,
         loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
         program_cache_entry::ProgramCacheEntry,
     },
@@ -1406,8 +1407,15 @@ impl Bank {
             let stakes = bank.get_top_epoch_stakes();
             let stakes = SerdeStakesToStakeFormat::from(stakes);
             for epoch in 0..=bank.get_leader_schedule_epoch(bank.slot) {
-                bank.epoch_stakes
-                    .insert(epoch, VersionedEpochStakes::new(stakes.clone(), epoch));
+                let leader_schedule = Self::leader_schedule_from_stakes(
+                    epoch,
+                    bank.epoch_schedule(),
+                    stakes.vote_accounts().as_ref(),
+                );
+                bank.epoch_stakes.insert(
+                    epoch,
+                    VersionedEpochStakes::new(stakes.clone(), epoch, leader_schedule),
+                );
             }
             bank.update_stake_history(None);
         }
@@ -2094,12 +2102,45 @@ impl Bank {
                 .fill_missing_sysvar_cache_entries(self)
         );
 
+        self.set_leader_info_sysvar_cache();
+
         PrepareBlockExecutionStats {
             update_epoch_time_us,
             distribute_rewards_time_us,
             cache_preparation_time_us,
             update_sysvars_time_us,
             fill_sysvar_cache_time_us,
+        }
+    }
+
+    fn set_leader_info_sysvar_cache(&self) {
+        // for joe: should this use wincode? sysvar cache appears to use bincode deser
+        let current_leader = self.leader();
+        let next_leader = self.next_leader();
+        let bytes = bincode::serialize(&LeaderInfo {
+            leader_id: current_leader.id,
+            next_leader_id: next_leader.id,
+            leader_vote: current_leader.vote_address,
+            next_leader_vote: next_leader.vote_address,
+        })
+        .unwrap();
+        self.transaction_processor
+            .sysvar_cache
+            .write()
+            .unwrap()
+            .set_leader_info(bytes);
+    }
+
+    fn next_leader(&self) -> SlotLeader {
+        let (epoch, slot_index) = self
+            .epoch_schedule()
+            .get_epoch_and_slot_index(self.slot + 1);
+        let VersionedEpochStakes::Current {
+            leader_schedule, ..
+        } = self.epoch_stakes.get(&epoch).unwrap();
+        match leader_schedule.get() {
+            Some(leader_schedule) => leader_schedule.get_slot_leader_at_index(slot_index as usize),
+            None => SlotLeader::default(),
         }
     }
 
@@ -2309,6 +2350,20 @@ impl Bank {
             ),
         );
         bank
+    }
+
+    fn leader_schedule_from_stakes(
+        epoch: Epoch,
+        epoch_schedule: &EpochSchedule,
+        epoch_vote_accounts: &VoteAccountsHashMap,
+    ) -> Option<solana_leader_schedule::LeaderSchedule> {
+        if epoch_vote_accounts
+            .values()
+            .all(|(stake, _account)| *stake == 0)
+        {
+            return None;
+        }
+        leader_schedule_from_vote_accounts(epoch, epoch_schedule, epoch_vote_accounts)
     }
 
     /// Compute the slot leader from epoch stakes during snapshot restoration.
@@ -2675,6 +2730,7 @@ impl Bank {
         // actually updated since tests don't need to be optimized for performance.
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        self.set_leader_info_sysvar_cache();
     }
 
     fn update_slot_history(&self) {
@@ -2734,7 +2790,13 @@ impl Bank {
                 None => self.get_top_epoch_stakes(),
             };
             let stakes = SerdeStakesToStakeFormat::from(stakes);
-            let new_epoch_stakes = VersionedEpochStakes::new(stakes, leader_schedule_epoch);
+            let leader_schedule = Self::leader_schedule_from_stakes(
+                leader_schedule_epoch,
+                self.epoch_schedule(),
+                stakes.vote_accounts().as_ref(),
+            );
+            let new_epoch_stakes =
+                VersionedEpochStakes::new(stakes, leader_schedule_epoch, leader_schedule);
             info!(
                 "new epoch stakes, epoch: {}, total_stake: {}",
                 leader_schedule_epoch,
@@ -3610,6 +3672,7 @@ impl Bank {
 
         self.transaction_processor
             .reset_and_fill_sysvar_cache_entries(self);
+        self.set_leader_info_sysvar_cache();
     }
 
     /// Get the nanosecond clock value. Returns `None` if the nanosecond clock has not been

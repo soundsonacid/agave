@@ -6,13 +6,42 @@ mod tests {
     use {
         super::*,
         crate::{
-            genesis_utils::activate_all_features_alpenglow, inflation_rewards::points::PointValue,
+            genesis_utils::{
+                activate_all_features_alpenglow, bootstrap_validator_stake_lamports,
+                create_genesis_config_with_leader,
+            },
+            inflation_rewards::points::PointValue,
+            leader_schedule_utils,
         },
         solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
         solana_genesis_config::create_genesis_config,
         solana_leader_schedule::SlotLeader,
+        solana_program_runtime::leader_temp::{LEADER_INFO_ID, LeaderInfo},
         solana_sysvar::epoch_rewards::EpochRewards,
     };
+
+    fn expected_leader_info(bank: &Bank) -> LeaderInfo {
+        let current = *bank.leader();
+        let next_slot = bank.slot().saturating_add(1);
+        let (epoch, slot_index) = bank.get_epoch_and_slot_index(next_slot);
+        let next = leader_schedule_utils::leader_schedule(epoch, bank)
+            .unwrap_or_else(|| panic!("missing leader schedule for epoch {epoch}"))[slot_index];
+        LeaderInfo {
+            leader_id: current.id,
+            next_leader_id: next.id,
+            leader_vote: current.vote_address,
+            next_leader_vote: next.vote_address,
+        }
+    }
+
+    fn cached_leader_info(bank: &Bank) -> LeaderInfo {
+        let sysvar_cache = bank.transaction_processor.sysvar_cache();
+        let buf = sysvar_cache
+            .sysvar_id_to_buffer(&LEADER_INFO_ID)
+            .as_ref()
+            .expect("leader info missing from sysvar cache");
+        bincode::deserialize(buf).expect("leader info cache is not a LeaderInfo")
+    }
 
     #[test]
     #[allow(deprecated)]
@@ -258,5 +287,55 @@ mod tests {
             .get_clock()
             .unwrap();
         assert_eq!(cached_clock.epoch_start_timestamp, parent_footer_timestamp);
+    }
+
+    #[test]
+    fn test_leader_info_sysvar_cache_from_new_from_parent() {
+        let genesis_config = create_genesis_config_with_leader(
+            100_000,
+            &solana_pubkey::new_rand(),
+            bootstrap_validator_stake_lamports(),
+        )
+        .genesis_config;
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+
+        let leader = SlotLeader::new_unique();
+        let bank1 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, leader, 1);
+
+        assert!(bank1.get_account(&LEADER_INFO_ID).is_none());
+        let cached = cached_leader_info(&bank1);
+        assert_eq!(cached, expected_leader_info(&bank1));
+        assert_eq!(cached.leader_id, leader.id);
+        assert_eq!(cached.leader_vote, leader.vote_address);
+        assert_ne!(cached.leader_id, cached.next_leader_id);
+    }
+
+    #[test]
+    fn test_leader_info_sysvar_cache_survives_footer_reset() {
+        let mut genesis_config = create_genesis_config_with_leader(
+            100_000,
+            &solana_pubkey::new_rand(),
+            bootstrap_validator_stake_lamports(),
+        )
+        .genesis_config;
+        activate_all_features_alpenglow(&mut genesis_config);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+
+        let leader = SlotLeader::new_unique();
+        let bank1 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, leader, 1);
+        let expected = expected_leader_info(&bank1);
+        assert_eq!(cached_leader_info(&bank1), expected);
+
+        let footer_timestamp_nanos = bank1
+            .clock()
+            .unix_timestamp
+            .saturating_add(42)
+            .saturating_mul(1_000_000_000);
+        bank1.update_clock_from_footer(footer_timestamp_nanos);
+
+        assert!(bank1.get_account(&LEADER_INFO_ID).is_none());
+        assert_eq!(cached_leader_info(&bank1), expected);
     }
 }

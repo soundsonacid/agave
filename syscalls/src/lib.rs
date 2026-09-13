@@ -4726,6 +4726,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_syscall_get_leader_info_sysvar() {
+        use solana_program_runtime::leader_temp::{LEADER_INFO_ID, LeaderInfo};
+
+        let config = Config::default();
+        let src = LeaderInfo {
+            leader_id: Pubkey::new_from_array([1; 32]),
+            next_leader_id: Pubkey::new_from_array([2; 32]),
+            leader_vote: Pubkey::new_from_array([3; 32]),
+            next_leader_vote: Pubkey::new_from_array([4; 32]),
+        };
+        let src_buf = bincode::serialize(&src).unwrap();
+        assert_eq!(src_buf.len(), mem::size_of::<LeaderInfo>());
+
+        // Accountless: an empty cache must not find this id.
+        {
+            with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+            let mut got_buf = vec![0; src_buf.len()];
+            let got_buf_va = 0x200000000;
+            let id_va = 0x300000000;
+            let id = LEADER_INFO_ID.to_bytes();
+            let memory_mapping = unsafe {
+                MemoryMapping::new(
+                    vec![
+                        MemoryRegion::new(&raw mut got_buf[..], got_buf_va),
+                        MemoryRegion::new(&raw const id, id_va),
+                    ],
+                    &config,
+                    SBPFVersion::V3,
+                )
+                .unwrap()
+            };
+            invoke_context
+                .memory_contexts
+                .mock_set_mapping_abi_v1(memory_mapping);
+            let result = SyscallGetSysvar::rust(
+                &mut invoke_context,
+                id_va,
+                got_buf_va,
+                0,
+                src_buf.len() as u64,
+                0,
+            );
+            assert_eq!(result.unwrap(), 2);
+        }
+
+        // `with_mock_invoke_context!` fills the cache from accounts, so inject
+        // LeaderInfo directly and swap the cache (same pattern as epoch stake).
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+        let mut sysvar_cache = SysvarCache::default();
+        sysvar_cache.set_sysvar_for_tests(&src);
+        let feature_set = SVMFeatureSet::default();
+        let program_runtime_environments = ProgramRuntimeEnvironments::mock();
+        struct MockCallback {}
+        impl InvokeContextCallback for MockCallback {}
+        invoke_context.environment_config = EnvironmentConfig::new(
+            Hash::default(),
+            0,
+            false,
+            &MockCallback {},
+            &feature_set,
+            &program_runtime_environments,
+            &sysvar_cache,
+        );
+
+        let mut got_buf = vec![0; src_buf.len()];
+        let got_buf_va = 0x200000000;
+        let id_va = 0x300000000;
+        let id = LEADER_INFO_ID.to_bytes();
+        let memory_mapping = unsafe {
+            MemoryMapping::new(
+                vec![
+                    MemoryRegion::new(&raw mut got_buf[..], got_buf_va),
+                    MemoryRegion::new(&raw const id, id_va),
+                ],
+                &config,
+                SBPFVersion::V3,
+            )
+            .unwrap()
+        };
+        invoke_context
+            .memory_contexts
+            .mock_set_mapping_abi_v1(memory_mapping);
+
+        let result = SyscallGetSysvar::rust(
+            &mut invoke_context,
+            id_va,
+            got_buf_va,
+            0,
+            src_buf.len() as u64,
+            0,
+        );
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(got_buf, src_buf);
+        assert_eq!(bincode::deserialize::<LeaderInfo>(&got_buf).unwrap(), src);
+    }
+
     #[test_case(false; "partial")]
     #[test_case(true; "full")]
     fn test_syscall_get_stake_history(filled: bool) {

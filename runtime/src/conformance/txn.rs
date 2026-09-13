@@ -32,6 +32,7 @@ use {
     solana_clock::{BankId, Clock, DEFAULT_TICKS_PER_SLOT, Epoch, MAX_PROCESSING_AGE},
     solana_epoch_schedule::EpochSchedule,
     solana_fee_calculator::FeeRateGovernor,
+    solana_leader_schedule::LeaderSchedule,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
     solana_sdk_ids::sysvar,
@@ -115,6 +116,7 @@ pub fn execute_txn(
         let mut entry = VersionedEpochStakes::new(
             SerdeStakesToStakeFormat::Stake(Stakes::<Stake>::default()),
             key,
+            None,
         );
         entry.set_total_stake(total_epoch_stake);
         epoch_stakes.insert(key, entry);
