@@ -4,6 +4,7 @@ pub use self::{
     logging::{
         SyscallLog, SyscallLogBpfComputeUnits, SyscallLogData, SyscallLogPubkey, SyscallLogU64,
     },
+    math::SyscallMath,
     mem_ops::{SyscallMemcmp, SyscallMemcpy, SyscallMemmove, SyscallMemset},
     sysvar::{
         SyscallGetClockSysvar, SyscallGetEpochRewardsSysvar, SyscallGetEpochScheduleSysvar,
@@ -58,6 +59,7 @@ use {
 
 mod cpi;
 mod logging;
+pub mod math;
 mod mem_ops;
 mod sysvar;
 
@@ -118,6 +120,10 @@ pub enum SyscallError {
     InvalidPointer,
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("Invalid sol_math op sequence")]
+    InvalidMathSequence,
+    #[error("sol_math divide by zero")]
+    MathDivideByZero,
 }
 
 impl SyscallError {
@@ -429,6 +435,9 @@ pub fn create_program_runtime_environment(
     SyscallGetEpochRewardsSysvar::register(&mut result, "sol_get_epoch_rewards_sysvar")?;
 
     // Memory ops
+    // Vector arithmetic (proof of concept, not feature gated)
+    SyscallMath::register(&mut result, "sol_math")?;
+
     SyscallMemcpy::register(&mut result, "sol_memcpy_")?;
     SyscallMemmove::register(&mut result, "sol_memmove_")?;
     SyscallMemset::register(&mut result, "sol_memset_")?;

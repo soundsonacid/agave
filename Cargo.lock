@@ -10381,8 +10381,7 @@ checksum = "dcf09694a0fc14e5ffb18f9b7b7c0f15ecb6eac5b5610bf76a1853459d19daf9"
 [[package]]
 name = "solana-sbpf"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "770b59169074b33cce3b0c119639b7f4e022c2c7071ec3608c323394ab39bd3f"
+source = "git+https://github.com/soundsonacid/sbpf?branch=sol-math#2578c8c5a9acc891b27ea8e768b72f40f066fbd3"
 dependencies = [
  "byteorder",
  "combine 3.8.1",
