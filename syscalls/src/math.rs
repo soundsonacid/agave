@@ -26,7 +26,13 @@
 //! divide, and truncate the result to the lane width. Binary ops compute `x op y` with `y`
 //! on top of the stack; SELECT is `cond then else SELECT` and tests `cond != 0`.
 //!
-//! Cost: `MATH_BASE_COST + ceil(lane_count / 8) * words_per_lane * tokens`.
+//! Cost: `MATH_BASE_COST + ceil(lane_count / 8) * MATH_CU_PER_THING * things`, where `things`
+//! is the number of vector instructions one 8-lane chunk executes: 4 for the chunk itself
+//! (three input loads, one store) plus `Token::things` per token. Pushes of `A`/`B`/`C` and
+//! `DUP` are register moves and cost nothing; most ops are one instruction; `SELECT` is two;
+//! `DIV`/`MOD` and `MUL128_DIV` include their per-lane scalar divides; `MUL128_SHR` is the
+//! 64x64->128 product from four 32x32 partials plus the window select. The same table prices
+//! u128 lanes, which run the scalar path.
 //!
 //! The output may be the same buffer as a vector input (an in-place update) or disjoint from
 //! every input; any other overlap fails the syscall, so the scalar and AVX-512 paths agree.
@@ -78,6 +84,10 @@ pub const SELECT: u8 = 50;
 pub const MATH_BASE_COST: u64 = 100;
 /// Lanes charged as one unit: one 512-bit vector of u64.
 pub const MATH_LANES_PER_UNIT: u64 = 8;
+/// CU per vector instruction per 8-lane chunk.
+pub const MATH_CU_PER_THING: u64 = 4;
+/// Instructions every chunk executes regardless of the program: three input loads, one store.
+pub const MATH_CHUNK_THINGS: u64 = 4;
 
 const MASK_52: u128 = (1 << 52) - 1;
 
@@ -130,6 +140,37 @@ impl Token {
             | Token::MulLo52
             | Token::MulHi52 => 2,
             Token::Mul128Div | Token::Mul128Shr | Token::Select => 3,
+        }
+    }
+
+    /// Vector instructions this token executes per 8-lane chunk on the AVX-512 path (constant
+    /// broadcasts hoisted out of the loop are not counted). This is the price list.
+    fn things(self) -> u64 {
+        match self {
+            Token::PushA | Token::PushB | Token::PushC | Token::Dup => 0,
+            Token::Lit(_)
+            | Token::Not
+            | Token::Neg
+            | Token::Add
+            | Token::Sub
+            | Token::And
+            | Token::Or
+            | Token::Xor
+            | Token::Min
+            | Token::Max
+            | Token::Lsh
+            | Token::Lrsh
+            | Token::Arsh
+            | Token::MulLo52
+            | Token::MulHi52 => 1,
+            // test mask + blend
+            Token::Select => 2,
+            // zero check, two stores, eight scalar divides, one load
+            Token::Div | Token::Mod => 12,
+            // zero check, three stores, eight (mul, div) pairs, one load
+            Token::Mul128Div => 21,
+            // mul_wide 15 + the shift window select 10
+            Token::Mul128Shr => 25,
         }
     }
 }
@@ -220,6 +261,21 @@ impl OpSequence {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Vector instructions one 8-lane chunk executes for this program, loads and store included.
+    pub fn things(&self) -> u64 {
+        MATH_CHUNK_THINGS + self.tokens[..self.len].iter().map(|token| token.things()).sum::<u64>()
+    }
+
+    /// CU charged for `lane_count` lanes.
+    pub fn cost(&self, lane_count: u64) -> u64 {
+        MATH_BASE_COST.saturating_add(
+            lane_count
+                .div_ceil(MATH_LANES_PER_UNIT)
+                .saturating_mul(MATH_CU_PER_THING)
+                .saturating_mul(self.things()),
+        )
     }
 
     fn evaluate<L: Lane>(&self, a: L, b: L, c: L) -> Result<L, Error> {
@@ -536,12 +592,7 @@ impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallMath {
     ) -> Result<u64, Error> {
         let sequence = OpSequence::decode(op_sequence)?;
         let words_per_lane = if sequence.wide { u128::WORDS } else { u64::WORDS } as u64;
-        let lane_units = lane_count
-            .div_ceil(MATH_LANES_PER_UNIT)
-            .saturating_mul(words_per_lane);
-        invoke_context.consume_checked(
-            MATH_BASE_COST.saturating_add(lane_units.saturating_mul(sequence.len() as u64)),
-        )?;
+        invoke_context.consume_checked(sequence.cost(lane_count))?;
         if lane_count == 0 {
             return Ok(0);
         }
@@ -849,6 +900,21 @@ mod tests {
         assert!(OpSequence::decode(encode(0, &[A, 63])).is_err(), "unknown token");
         assert!(OpSequence::decode(encode(0, &[A, B, C, A, B, C, A, B, C, LIT])).is_err(), "lit without value");
         assert_eq!(OpSequence::decode(encode(0, &[A, B, ADD])).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cost_counts_instructions_per_chunk() {
+        let things = |tokens: &[u8]| OpSequence::decode(encode(VECTOR_ALL, tokens)).unwrap().things();
+        assert_eq!(things(&[A, B, ADD]), 4 + 1);
+        assert_eq!(things(&[A, B, A, SUB, C, MUL_HI52, ADD]), 4 + 3);
+        assert_eq!(things(&[A, NEG, LIT, 63, ARSH, B, C, SELECT]), 4 + 1 + 1 + 1 + 2);
+        assert_eq!(things(&[A, B, LIT, 26, MUL128_SHR]), 4 + 1 + 25);
+        assert_eq!(things(&[A, B, C, MUL128_DIV]), 4 + 21);
+        let add = OpSequence::decode(encode(VECTOR_ALL, &[A, B, ADD])).unwrap();
+        assert_eq!(add.cost(0), 100);
+        assert_eq!(add.cost(1), 100 + 4 * 5);
+        assert_eq!(add.cost(64), 100 + 8 * 4 * 5);
+        assert_eq!(add.cost(65), 100 + 9 * 4 * 5);
     }
 
     #[test]
