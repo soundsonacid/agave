@@ -32,14 +32,14 @@
 //! `DUP` are register moves and cost nothing; most ops are one instruction; `SELECT` is two;
 //! `DIV`/`MOD` and `MUL128_DIV` include their per-lane scalar divides; `MUL128_SHR` is the
 //! 64x64->128 product from four 32x32 partials plus the window select. The same table prices
-//! u128 lanes, which run the scalar path.
+//! u128 lanes, although a u128 op takes more instructions than its u64 form.
 //!
 //! The output may be the same buffer as a vector input (an in-place update) or disjoint from
 //! every input; any other overlap fails the syscall, so the scalar and AVX-512 paths agree.
 //!
-//! Host execution: on x86-64 with AVX-512F + IFMA, u64 lanes run eight at a time with the
-//! stack held in `zmm` registers (`avx512` module); everywhere else, and for u128 lanes, the
-//! same program runs one lane at a time.
+//! Host execution: on x86-64 with AVX-512F + IFMA, lanes run eight at a time with the stack
+//! held in `zmm` registers (`avx512` module), a u128 lane as a low and a high limb in two
+//! registers; everywhere else the same program runs one lane at a time.
 
 use {super::*, std::ptr};
 
@@ -554,26 +554,92 @@ fn mul_wide_u128(x: u128, y: u128) -> (u128, u128) {
     (high, low)
 }
 
-/// Low 128 bits of `(high:low) / divisor`, by shift-subtract long division.
+/// Low 128 bits of `(high:low) / divisor`; `divisor` must be nonzero. A divisor that fits in
+/// u64 takes one two-by-one limb divide per dividend limb, any other Knuth's algorithm D.
 fn div_wide_u128(high: u128, low: u128, divisor: u128) -> u128 {
+    let dividend = [low as u64, (low >> 64) as u64, high as u64, (high >> 64) as u64];
+    let quotient = if divisor >> 64 == 0 {
+        div_limbs_by_u64(dividend, divisor as u64)
+    } else {
+        div_limbs_knuth(dividend, divisor)
+    };
+    (quotient[1] as u128) << 64 | quotient[0] as u128
+}
+
+/// Schoolbook division of four limbs (least significant first) by one. Each step divides a
+/// two-limb value whose high limb is the running remainder, below the divisor, so every
+/// quotient digit fits in a limb.
+fn div_limbs_by_u64(dividend: [u64; 4], divisor: u64) -> [u64; 4] {
+    let divisor = divisor as u128;
+    let mut quotient = [0u64; 4];
     let mut remainder = 0u128;
-    let mut quotient = 0u128;
-    for bit in (0..256u32).rev() {
-        let next_bit = if bit >= 128 {
-            (high >> (bit - 128)) & 1
-        } else {
-            (low >> bit) & 1
-        };
-        // The remainder is below the divisor, so shifting it left loses at most one bit,
-        // and that bit means the shifted remainder is above the divisor.
-        let overflowed = remainder >> 127 != 0;
-        remainder = (remainder << 1) | next_bit;
-        if overflowed || remainder >= divisor {
-            remainder = remainder.wrapping_sub(divisor);
-            quotient = (quotient << 1) | 1;
-        } else {
-            quotient <<= 1;
+    for index in (0..4).rev() {
+        let current = remainder << 64 | dividend[index] as u128;
+        let digit = current / divisor;
+        remainder = current - digit * divisor;
+        quotient[index] = digit as u64;
+    }
+    quotient
+}
+
+/// Knuth's algorithm D (TAOCP vol. 2, 4.3.1) for four dividend limbs over a two-limb divisor
+/// whose high limb is nonzero. Both are shifted so the divisor's top bit is set; then each of
+/// the three quotient digits is estimated from the top two limbs of a three-limb window and
+/// corrected against the divisor's low limb. With two divisor limbs that correction compares
+/// the whole divisor, so the add-back step is a safeguard that should never run.
+fn div_limbs_knuth(dividend: [u64; 4], divisor: u128) -> [u64; 4] {
+    const BASE: u128 = 1 << 64;
+    let shift = ((divisor >> 64) as u64).leading_zeros();
+    let normalized = divisor << shift;
+    let (high_limb, low_limb) = ((normalized >> 64) as u64 as u128, normalized as u64 as u128);
+    let mut window = [0u64; 5];
+    if shift == 0 {
+        window[..4].copy_from_slice(&dividend);
+    } else {
+        window[0] = dividend[0] << shift;
+        for index in 1..4 {
+            window[index] = dividend[index] << shift | dividend[index - 1] >> (64 - shift);
         }
+        window[4] = dividend[3] >> (64 - shift);
+    }
+
+    let mut quotient = [0u64; 4];
+    for digit in (0..3).rev() {
+        let top = (window[digit + 2] as u128) << 64 | window[digit + 1] as u128;
+        let mut estimate = top / high_limb;
+        let mut remainder = top - estimate * high_limb;
+        // the estimate is at most two too large; the test only means something while the
+        // remainder still fits in a limb
+        while estimate >= BASE || estimate * low_limb > (remainder << 64 | window[digit] as u128) {
+            estimate -= 1;
+            remainder += high_limb;
+            if remainder >= BASE {
+                break;
+            }
+        }
+
+        // window[digit..digit + 3] -= estimate * divisor
+        let product_low = estimate * low_limb;
+        let product_high = estimate * high_limb + (product_low >> 64);
+        let (limb_0, borrow_0) = window[digit].overflowing_sub(product_low as u64);
+        let (limb_1, borrow_1a) = window[digit + 1].overflowing_sub(product_high as u64);
+        let (limb_1, borrow_1b) = limb_1.overflowing_sub(borrow_0 as u64);
+        let (limb_2, borrow_2a) = window[digit + 2].overflowing_sub((product_high >> 64) as u64);
+        let (limb_2, borrow_2b) = limb_2.overflowing_sub((borrow_1a | borrow_1b) as u64);
+        window[digit] = limb_0;
+        window[digit + 1] = limb_1;
+        window[digit + 2] = limb_2;
+        if borrow_2a || borrow_2b {
+            // one too large after all: add the divisor back
+            estimate -= 1;
+            let (sum_0, carry_0) = window[digit].overflowing_add(low_limb as u64);
+            let (sum_1, carry_1a) = window[digit + 1].overflowing_add(high_limb as u64);
+            let (sum_1, carry_1b) = sum_1.overflowing_add(carry_0 as u64);
+            window[digit] = sum_0;
+            window[digit + 1] = sum_1;
+            window[digit + 2] = window[digit + 2].wrapping_add((carry_1a | carry_1b) as u64);
+        }
+        quotient[digit] = estimate as u64;
     }
     quotient
 }
@@ -638,6 +704,13 @@ impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallMath {
         }
 
         if sequence.wide {
+            #[cfg(target_arch = "x86_64")]
+            if avx512::available() {
+                // SAFETY: the pointers were translated for every lane above and the CPU
+                // features were just checked.
+                unsafe { avx512::run_lanes_u128(&sequence, lane_count as usize, inputs, strides, output)? };
+                return Ok(0);
+            }
             run_lanes::<u128>(&sequence, lane_count as usize, inputs, strides, output)?;
         } else {
             #[cfg(target_arch = "x86_64")]
@@ -884,6 +957,356 @@ mod avx512 {
         );
         _mm512_mask_blend_epi64(below_64, high_part, low_part)
     }
+
+    /// Eight u128 lanes as two limbs: `lo` holds the low 64 bits of every lane, `hi` the high.
+    #[derive(Clone, Copy)]
+    struct Wide {
+        lo: __m512i,
+        hi: __m512i,
+    }
+
+    /// The same stack program over eight u128 lanes at a time, each stack slot a pair of `zmm`
+    /// registers. Divides run per lane on the scalar `Lane` code after the zero check.
+    ///
+    /// # Safety
+    /// Every pointer must cover `lane_count` lanes of two words (one lane where its stride is
+    /// zero), and the CPU must support AVX-512F and AVX-512IFMA.
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    pub unsafe fn run_lanes_u128(
+        sequence: &OpSequence,
+        lane_count: usize,
+        inputs: [*const u64; 3],
+        strides: [usize; 3],
+        output: *mut u64,
+    ) -> Result<(), Error> {
+        let mut lane = 0;
+        while lane < lane_count {
+            let remaining = lane_count - lane;
+            let active: __mmask8 = if remaining >= LANES { 0xff } else { (1u8 << remaining) - 1 };
+            let (a, b, c) = unsafe {
+                (
+                    load_wide(inputs[0], strides[0], lane, active),
+                    load_wide(inputs[1], strides[1], lane, active),
+                    load_wide(inputs[2], strides[2], lane, active),
+                )
+            };
+            let result = unsafe { evaluate_wide_chunk(sequence, a, b, c, active)? };
+            unsafe { store_wide(output.wrapping_add(lane * 2), active, result) };
+            lane += LANES;
+        }
+        Ok(())
+    }
+
+    /// Word masks for the two 8-word halves of a chunk: lane `i` is words `2i` and `2i + 1`.
+    fn word_masks(active: __mmask8) -> (__mmask8, __mmask8) {
+        let spread = |lanes: u8| -> __mmask8 {
+            let mut words = 0;
+            for lane in 0..4 {
+                if lanes >> lane & 1 != 0 {
+                    words |= 0b11 << (2 * lane);
+                }
+            }
+            words
+        };
+        (spread(active & 0x0f), spread(active >> 4))
+    }
+
+    /// Memory holds `lo, hi` per lane; two loads and two permutes split it into limbs.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn load_wide(pointer: *const u64, stride: usize, lane: usize, active: __mmask8) -> Wide {
+        if stride == 0 {
+            let (low, high) = unsafe { (ptr::read_unaligned(pointer), ptr::read_unaligned(pointer.add(1))) };
+            return Wide { lo: _mm512_set1_epi64(low as i64), hi: _mm512_set1_epi64(high as i64) };
+        }
+        let (first, second) = word_masks(active);
+        // masked-off words are never touched, so the second half may start past the buffer
+        let start = pointer.wrapping_add(lane * 2);
+        let words_0_7 = unsafe { _mm512_maskz_loadu_epi64(first, start as *const i64) };
+        let words_8_15 = unsafe { _mm512_maskz_loadu_epi64(second, start.wrapping_add(8) as *const i64) };
+        Wide {
+            lo: _mm512_permutex2var_epi64(words_0_7, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), words_8_15),
+            hi: _mm512_permutex2var_epi64(words_0_7, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), words_8_15),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn store_wide(destination: *mut u64, active: __mmask8, value: Wide) {
+        let (first, second) = word_masks(active);
+        let words_0_7 = _mm512_permutex2var_epi64(value.lo, _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11), value.hi);
+        let words_8_15 = _mm512_permutex2var_epi64(value.lo, _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15), value.hi);
+        unsafe {
+            _mm512_mask_storeu_epi64(destination as *mut i64, first, words_0_7);
+            _mm512_mask_storeu_epi64(destination.wrapping_add(8) as *mut i64, second, words_8_15);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512ifma")]
+    unsafe fn evaluate_wide_chunk(
+        sequence: &OpSequence,
+        a: Wide,
+        b: Wide,
+        c: Wide,
+        active: __mmask8,
+    ) -> Result<Wide, Error> {
+        let zero = _mm512_setzero_si512();
+        let all_ones = _mm512_set1_epi64(-1);
+        let zero_wide = Wide { lo: zero, hi: zero };
+        let mut stack = [zero_wide; MAX_TOKENS];
+        let mut depth = 0usize;
+        for token in &sequence.tokens[..sequence.len] {
+            let base = depth - token.operands();
+            let result = match *token {
+                Token::PushA => a,
+                Token::PushB => b,
+                Token::PushC => c,
+                Token::Lit(value) => Wide { lo: _mm512_set1_epi64(value as i64), hi: zero },
+                Token::Dup => stack[base],
+                Token::Not => Wide {
+                    lo: _mm512_xor_si512(stack[base].lo, all_ones),
+                    hi: _mm512_xor_si512(stack[base].hi, all_ones),
+                },
+                Token::Neg => unsafe { wide_sub(zero_wide, stack[base]) },
+                Token::Add => unsafe { wide_add(stack[base], stack[base + 1]) },
+                Token::Sub => unsafe { wide_sub(stack[base], stack[base + 1]) },
+                Token::And => Wide {
+                    lo: _mm512_and_si512(stack[base].lo, stack[base + 1].lo),
+                    hi: _mm512_and_si512(stack[base].hi, stack[base + 1].hi),
+                },
+                Token::Or => Wide {
+                    lo: _mm512_or_si512(stack[base].lo, stack[base + 1].lo),
+                    hi: _mm512_or_si512(stack[base].hi, stack[base + 1].hi),
+                },
+                Token::Xor => Wide {
+                    lo: _mm512_xor_si512(stack[base].lo, stack[base + 1].lo),
+                    hi: _mm512_xor_si512(stack[base].hi, stack[base + 1].hi),
+                },
+                Token::Min => {
+                    let less = unsafe { signed_less(stack[base], stack[base + 1]) };
+                    unsafe { blend(less, stack[base + 1], stack[base]) }
+                }
+                Token::Max => {
+                    let less = unsafe { signed_less(stack[base], stack[base + 1]) };
+                    unsafe { blend(less, stack[base], stack[base + 1]) }
+                }
+                Token::Lsh => unsafe { wide_shift_left(stack[base], stack[base + 1]) },
+                Token::Lrsh => unsafe { wide_shift_right_logical(stack[base], stack[base + 1]) },
+                Token::Arsh => unsafe { wide_shift_right_arithmetic(stack[base], stack[base + 1]) },
+                Token::Div => unsafe {
+                    per_lane([stack[base], stack[base + 1], zero_wide], active, |x, y, _| x.checked_div(y))?
+                },
+                Token::Mod => unsafe {
+                    per_lane([stack[base], stack[base + 1], zero_wide], active, |x, y, _| x.checked_rem(y))?
+                },
+                // both read only the low 52 bits of each operand, and the result fits in 52
+                Token::MulLo52 => Wide { lo: _mm512_madd52lo_epu64(zero, stack[base].lo, stack[base + 1].lo), hi: zero },
+                Token::MulHi52 => Wide { lo: _mm512_madd52hi_epu64(zero, stack[base].lo, stack[base + 1].lo), hi: zero },
+                Token::Mul128Div => unsafe {
+                    per_lane([stack[base], stack[base + 1], stack[base + 2]], active, |x, y, divisor| {
+                        x.mul_wide_div(y, divisor)
+                    })?
+                },
+                Token::Mul128Shr => unsafe { wide_mul_shr(stack[base], stack[base + 1], stack[base + 2]) },
+                Token::Select => {
+                    let condition = _mm512_or_si512(stack[base].lo, stack[base].hi);
+                    let nonzero = _mm512_test_epi64_mask(condition, condition);
+                    unsafe { blend(nonzero, stack[base + 2], stack[base + 1]) }
+                }
+            };
+            stack[base] = result;
+            depth = base + 1;
+        }
+        Ok(stack[0])
+    }
+
+    /// `if_set` in the lanes of `mask`, `if_clear` elsewhere.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn blend(mask: __mmask8, if_clear: Wide, if_set: Wide) -> Wide {
+        Wide {
+            lo: _mm512_mask_blend_epi64(mask, if_clear.lo, if_set.lo),
+            hi: _mm512_mask_blend_epi64(mask, if_clear.hi, if_set.hi),
+        }
+    }
+
+    /// `x + y` per 64-bit limb and the lanes that carried out.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn add_carry(x: __m512i, y: __m512i) -> (__m512i, __mmask8) {
+        let sum = _mm512_add_epi64(x, y);
+        (sum, _mm512_cmplt_epu64_mask(sum, x))
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_add(x: Wide, y: Wide) -> Wide {
+        let (lo, carry) = unsafe { add_carry(x.lo, y.lo) };
+        let hi = _mm512_add_epi64(x.hi, y.hi);
+        Wide { lo, hi: _mm512_mask_add_epi64(hi, carry, hi, _mm512_set1_epi64(1)) }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_sub(x: Wide, y: Wide) -> Wide {
+        let borrow = _mm512_cmplt_epu64_mask(x.lo, y.lo);
+        let hi = _mm512_sub_epi64(x.hi, y.hi);
+        Wide {
+            lo: _mm512_sub_epi64(x.lo, y.lo),
+            hi: _mm512_mask_sub_epi64(hi, borrow, hi, _mm512_set1_epi64(1)),
+        }
+    }
+
+    /// Lanes where `x < y` as i128: the high limbs decide, signed, unless they are equal.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn signed_less(x: Wide, y: Wide) -> __mmask8 {
+        let high_less = _mm512_cmplt_epi64_mask(x.hi, y.hi);
+        let high_equal = _mm512_cmpeq_epi64_mask(x.hi, y.hi);
+        high_less | (high_equal & _mm512_cmplt_epu64_mask(x.lo, y.lo))
+    }
+
+    /// Lanes whose u128 `count` is below `limit`.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn count_below(count: Wide, limit: i64) -> __mmask8 {
+        _mm512_cmpeq_epi64_mask(count.hi, _mm512_setzero_si512())
+            & _mm512_cmplt_epu64_mask(count.lo, _mm512_set1_epi64(limit))
+    }
+
+    // In the shifts below a variable shift by 64 or more gives 0 (srav: the sign fill), so the
+    // cross-limb term `64 - count` is 0 at count 0, and each window's wrong-window values are
+    // masked off.
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_shift_left(x: Wide, count: Wide) -> Wide {
+        let (below_64, below_128) = unsafe { (count_below(count, 64), count_below(count, 128)) };
+        let sixty_four = _mm512_set1_epi64(64);
+        let shift = count.lo;
+        let low = _mm512_sllv_epi64(x.lo, shift);
+        let high = _mm512_or_si512(
+            _mm512_sllv_epi64(x.hi, shift),
+            _mm512_srlv_epi64(x.lo, _mm512_sub_epi64(sixty_four, shift)),
+        );
+        let high_from_low = _mm512_sllv_epi64(x.lo, _mm512_sub_epi64(shift, sixty_four));
+        Wide {
+            lo: _mm512_maskz_mov_epi64(below_64, low),
+            hi: _mm512_maskz_mov_epi64(below_128, _mm512_mask_blend_epi64(below_64, high_from_low, high)),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_shift_right_logical(x: Wide, count: Wide) -> Wide {
+        let (below_64, below_128) = unsafe { (count_below(count, 64), count_below(count, 128)) };
+        let sixty_four = _mm512_set1_epi64(64);
+        let shift = count.lo;
+        let low = _mm512_or_si512(
+            _mm512_srlv_epi64(x.lo, shift),
+            _mm512_sllv_epi64(x.hi, _mm512_sub_epi64(sixty_four, shift)),
+        );
+        let low_from_high = _mm512_srlv_epi64(x.hi, _mm512_sub_epi64(shift, sixty_four));
+        Wide {
+            lo: _mm512_maskz_mov_epi64(below_128, _mm512_mask_blend_epi64(below_64, low_from_high, low)),
+            hi: _mm512_maskz_mov_epi64(below_64, _mm512_srlv_epi64(x.hi, shift)),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_shift_right_arithmetic(x: Wide, count: Wide) -> Wide {
+        let sixty_four = _mm512_set1_epi64(64);
+        // a count at or past the width shifts by 127: every bit the sign
+        let below_128 = unsafe { count_below(count, 128) };
+        let shift = _mm512_mask_mov_epi64(_mm512_set1_epi64(127), below_128, count.lo);
+        let below_64 = _mm512_cmplt_epu64_mask(shift, sixty_four);
+        let low = _mm512_or_si512(
+            _mm512_srlv_epi64(x.lo, shift),
+            _mm512_sllv_epi64(x.hi, _mm512_sub_epi64(sixty_four, shift)),
+        );
+        let low_from_high = _mm512_srav_epi64(x.hi, _mm512_sub_epi64(shift, sixty_four));
+        Wide {
+            lo: _mm512_mask_blend_epi64(below_64, low_from_high, low),
+            hi: _mm512_mask_blend_epi64(below_64, _mm512_srai_epi64::<63>(x.hi), _mm512_srav_epi64(x.hi, shift)),
+        }
+    }
+
+    /// Limb `word + offset` of the six `limbs`, picked per lane (`word` is 0..=3).
+    #[target_feature(enable = "avx512f")]
+    unsafe fn pick_limb(limbs: &[__m512i; 6], word: __m512i, offset: usize) -> __m512i {
+        let mut picked = _mm512_setzero_si512();
+        for index in 0..4 {
+            let here = _mm512_cmpeq_epi64_mask(word, _mm512_set1_epi64(index as i64));
+            picked = _mm512_mask_mov_epi64(picked, here, limbs[index + offset]);
+        }
+        picked
+    }
+
+    /// `(x * y) >> shift` over the full 256-bit product, truncated to 128 bits.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn wide_mul_shr(x: Wide, y: Wide, shift: Wide) -> Wide {
+        let one = _mm512_set1_epi64(1);
+        let carries = |a: __mmask8, b: __mmask8, c: __mmask8| {
+            _mm512_add_epi64(
+                _mm512_add_epi64(_mm512_maskz_mov_epi64(a, one), _mm512_maskz_mov_epi64(b, one)),
+                _mm512_maskz_mov_epi64(c, one),
+            )
+        };
+        let (high_00, low_00) = unsafe { mul_wide(x.lo, y.lo) };
+        let (high_01, low_01) = unsafe { mul_wide(x.lo, y.hi) };
+        let (high_10, low_10) = unsafe { mul_wide(x.hi, y.lo) };
+        let (high_11, low_11) = unsafe { mul_wide(x.hi, y.hi) };
+        // limb 1 = high_00 + low_01 + low_10, carrying at most two into limb 2
+        let (limb_1, carry_a) = unsafe { add_carry(high_00, low_01) };
+        let (limb_1, carry_b) = unsafe { add_carry(limb_1, low_10) };
+        let carry_1 = carries(carry_a, carry_b, 0);
+        // limb 2 = high_01 + high_10 + low_11 + carry_1
+        let (limb_2, carry_a) = unsafe { add_carry(high_01, high_10) };
+        let (limb_2, carry_b) = unsafe { add_carry(limb_2, low_11) };
+        let (limb_2, carry_c) = unsafe { add_carry(limb_2, carry_1) };
+        // the product fits in 256 bits, so limb 3 cannot carry out
+        let limb_3 = _mm512_add_epi64(high_11, carries(carry_a, carry_b, carry_c));
+        let zero = _mm512_setzero_si512();
+        let limbs = [low_00, limb_1, limb_2, limb_3, zero, zero];
+
+        let word = _mm512_srli_epi64::<6>(shift.lo);
+        let bit = _mm512_and_si512(shift.lo, _mm512_set1_epi64(63));
+        let complement = _mm512_sub_epi64(_mm512_set1_epi64(64), bit);
+        let (first, second, third) =
+            unsafe { (pick_limb(&limbs, word, 0), pick_limb(&limbs, word, 1), pick_limb(&limbs, word, 2)) };
+        let below_256 = unsafe { count_below(shift, 256) };
+        Wide {
+            lo: _mm512_maskz_mov_epi64(
+                below_256,
+                _mm512_or_si512(_mm512_srlv_epi64(first, bit), _mm512_sllv_epi64(second, complement)),
+            ),
+            hi: _mm512_maskz_mov_epi64(
+                below_256,
+                _mm512_or_si512(_mm512_srlv_epi64(second, bit), _mm512_sllv_epi64(third, complement)),
+            ),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn to_wide_lanes(value: Wide) -> [u128; LANES] {
+        let (low, high) = unsafe { (to_array(value.lo), to_array(value.hi)) };
+        std::array::from_fn(|lane| (high[lane] as u128) << 64 | low[lane] as u128)
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn from_wide_lanes(lanes: &[u128; LANES]) -> Wide {
+        let low: [u64; LANES] = std::array::from_fn(|lane| lanes[lane] as u64);
+        let high: [u64; LANES] = std::array::from_fn(|lane| (lanes[lane] >> 64) as u64);
+        unsafe { Wide { lo: from_array(&low), hi: from_array(&high) } }
+    }
+
+    /// No vector divide: each active lane runs `op`, and `None` there is a zero divisor.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn per_lane(
+        operands: [Wide; 3],
+        active: __mmask8,
+        op: impl Fn(u128, u128, u128) -> Option<u128>,
+    ) -> Result<Wide, Error> {
+        let (x, y, z) =
+            unsafe { (to_wide_lanes(operands[0]), to_wide_lanes(operands[1]), to_wide_lanes(operands[2])) };
+        let mut results = x;
+        for lane in 0..LANES {
+            if active >> lane & 1 != 0 {
+                results[lane] = op(x[lane], y[lane], z[lane]).ok_or(SyscallError::MathDivideByZero)?;
+            }
+        }
+        Ok(unsafe { from_wide_lanes(&results) })
+    }
 }
 
 #[cfg(test)]
@@ -947,6 +1370,76 @@ mod tests {
         assert_eq!(div_wide_u128(high, low, u128::MAX), u128::MAX - 5);
         assert_eq!(div_wide_u128(0, 1_000, 7), 142);
         assert!(evaluate_u64(word, 1, 2, 0).is_err(), "divide by zero");
+    }
+
+    /// The old bit-at-a-time long division, kept as the reference for `div_wide_u128`.
+    fn div_wide_reference(high: u128, low: u128, divisor: u128) -> u128 {
+        let mut remainder = 0u128;
+        let mut quotient = 0u128;
+        for bit in (0..256u32).rev() {
+            let next_bit = if bit >= 128 { (high >> (bit - 128)) & 1 } else { (low >> bit) & 1 };
+            let overflowed = remainder >> 127 != 0;
+            remainder = (remainder << 1) | next_bit;
+            if overflowed || remainder >= divisor {
+                remainder = remainder.wrapping_sub(divisor);
+                quotient = (quotient << 1) | 1;
+            } else {
+                quotient <<= 1;
+            }
+        }
+        quotient
+    }
+
+    /// Both branches of `div_wide_u128` against the reference: divisors on either side of
+    /// 2^64, and dividends built as `divisor * quotient + remainder` with quotient digits at
+    /// the limb boundaries, where algorithm D's digit estimate needs correcting.
+    #[test]
+    fn wide_division_matches_shift_subtract() {
+        let state = std::cell::Cell::new(0x2545_f491_4f6c_dd1du64);
+        let next = || {
+            let mut value = state.get();
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            state.set(value);
+            value
+        };
+        let random_u128 = || (next() as u128) << 64 | next() as u128;
+        let edges: [u128; 14] = [
+            1, 2, 3, 7, 1_000_000_000, u64::MAX as u128 - 1, u64::MAX as u128, 1 << 64, (1 << 64) + 1,
+            (1 << 65) - 1, 1 << 127, (1 << 127) + 1, u128::MAX - 1, u128::MAX,
+        ];
+        let digits: [u128; 8] = [0, 1, u64::MAX as u128 - 1, u64::MAX as u128, 1 << 64, (1 << 64) + 1, u128::MAX - 1, u128::MAX];
+        let mut divisors: Vec<u128> = edges.to_vec();
+        for _ in 0..200 {
+            let value = random_u128();
+            divisors.extend([value, value >> (next() % 128), value | 1 << 127, value >> 64 | 1 << 64]);
+        }
+        let mut cases = 0;
+        for &divisor in divisors.iter().filter(|divisor| **divisor != 0) {
+            let mut dividends: Vec<(u128, u128)> =
+                vec![(0, 0), (0, 1), (u128::MAX, u128::MAX), (0, u128::MAX), (u128::MAX, 0), (divisor >> 1, divisor)];
+            for &quotient in &digits {
+                for remainder in [0, 1, divisor - 1] {
+                    let (high, low) = mul_wide_u128(divisor, quotient);
+                    let (low, carry) = low.overflowing_add(remainder);
+                    dividends.push((high.wrapping_add(carry as u128), low));
+                }
+            }
+            for _ in 0..8 {
+                dividends.push(mul_wide_u128(random_u128(), random_u128()));
+                dividends.push((random_u128() >> (next() % 128), random_u128()));
+            }
+            for (high, low) in dividends {
+                assert_eq!(
+                    div_wide_u128(high, low, divisor),
+                    div_wide_reference(high, low, divisor),
+                    "({high:#x}:{low:#x}) / {divisor:#x}"
+                );
+                cases += 1;
+            }
+        }
+        assert!(cases > 30_000, "{cases} cases");
     }
 
     #[test]
@@ -1018,5 +1511,103 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The u128 form of `avx512_matches_scalar`, including zero divisors, shift counts in every
+    /// window, counts with a nonzero high limb, and min/max pairs that differ only in the low limb.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_u128_matches_scalar() {
+        if !avx512::available() {
+            eprintln!("skipping: this CPU has no AVX-512 IFMA");
+            return;
+        }
+        let sequences: [&[u8]; 25] = [
+            &[A, B, ADD], &[A, B, SUB], &[A, B, AND], &[A, B, OR], &[A, B, XOR],
+            &[A, NOT], &[A, NEG], &[A, B, MIN], &[A, B, MAX],
+            &[A, B, LSH], &[A, B, LRSH], &[A, B, ARSH], &[A, B, DIV], &[A, B, MOD],
+            &[A, B, MUL_LO52], &[A, B, MUL_HI52], &[A, B, C, MUL128_SHR], &[A, B, C, MUL128_DIV],
+            &[A, B, C, SELECT], &[A, B, A, SUB, C, MUL_HI52, ADD], &[A, LIT, 26, LRSH, B, MIN],
+            &[A, LIT, 63, LSH], &[A, B, LIT, 60, MUL128_SHR], &[A, B, LIT, 0, MUL128_SHR], &[A, C, ARSH, B, MAX],
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // one of eight shapes at random, so any two can meet in one lane; shape 6 is a shift
+        // count past the width whose low limb alone would look in range, shape 7 is nonzero
+        // with a zero low limb
+        let mut value = || -> u128 {
+            match next() % 8 {
+                0 => (next() as u128) << 64 | next() as u128,
+                1 => (next() % 300) as u128,
+                2 => next() as u128,
+                3 => 1 << 127 | (next() as u128) << 64 | next() as u128,
+                4 => 0,
+                5 => u128::MAX - (next() % 3) as u128,
+                6 => (next() % 3 + 1) as u128 * (1 << 64) | (next() % 200) as u128,
+                _ => ((next() | 1) as u128) << 64,
+            }
+        };
+        let to_words = |values: &[u128]| -> Vec<u64> {
+            values.iter().flat_map(|value| [*value as u64, (*value >> 64) as u64]).collect()
+        };
+        for tokens in sequences {
+            let sequence = OpSequence::decode(encode(VECTOR_ALL | FLAG_WIDE as u8, tokens)).unwrap();
+            for lane_count in [1usize, 3, 4, 5, 7, 8, 9, 16, 64] {
+                let a: Vec<u128> = (0..lane_count).map(|_| value()).collect();
+                let mut b: Vec<u128> = (0..lane_count).map(|_| value()).collect();
+                let c: Vec<u128> = (0..lane_count).map(|_| value()).collect();
+                // same high limb as `a`, so min and max have to look at the low limb
+                for lane in (0..lane_count).step_by(4) {
+                    b[lane] = a[lane] & !(u64::MAX as u128) | value() as u64 as u128;
+                }
+                let (a_words, b_words, c_words) = (to_words(&a), to_words(&b), to_words(&c));
+                for strides in [[2usize, 2, 2], [0, 2, 2], [2, 0, 2], [2, 2, 0]] {
+                    let pick = |values: &[u128], stride: usize, lane: usize| values[if stride == 0 { 0 } else { lane }];
+                    let expected: Result<Vec<u128>, _> = (0..lane_count)
+                        .map(|lane| {
+                            sequence.evaluate(pick(&a, strides[0], lane), pick(&b, strides[1], lane), pick(&c, strides[2], lane))
+                        })
+                        .collect();
+                    let mut output = vec![0u64; 2 * lane_count];
+                    let result = unsafe {
+                        avx512::run_lanes_u128(
+                            &sequence,
+                            lane_count,
+                            [a_words.as_ptr(), b_words.as_ptr(), c_words.as_ptr()],
+                            strides,
+                            output.as_mut_ptr(),
+                        )
+                    };
+                    match expected {
+                        Ok(expected) => {
+                            assert!(result.is_ok(), "{tokens:?} lanes {lane_count} strides {strides:?}: {result:?}");
+                            assert_eq!(output, to_words(&expected), "{tokens:?} lanes {lane_count} strides {strides:?}");
+                        }
+                        Err(_) => assert!(result.is_err(), "{tokens:?} lanes {lane_count} strides {strides:?}: expected an error"),
+                    }
+                }
+            }
+        }
+
+        // random inputs almost never carry out of product limb 2 (the partial sum has to land
+        // on 2^64 - 1 or 2^64 - 2); here limb 1 carries one and limb 2 is exactly 2^64 - 1
+        let x = (u64::MAX as u128) << 64 | 1;
+        let y = 1u128 << 64 | 1;
+        let sequence = OpSequence::decode(encode(VECTOR_ALL | FLAG_WIDE as u8, &[A, B, C, MUL128_SHR])).unwrap();
+        let shifts: Vec<u128> = vec![0, 1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 255, 256, 1 << 64];
+        let lanes = shifts.len();
+        let (xs, ys) = (to_words(&vec![x; lanes]), to_words(&vec![y; lanes]));
+        let mut output = vec![0u64; 2 * lanes];
+        unsafe {
+            avx512::run_lanes_u128(&sequence, lanes, [xs.as_ptr(), ys.as_ptr(), to_words(&shifts).as_ptr()], [2, 2, 2], output.as_mut_ptr())
+                .unwrap()
+        };
+        let expected: Vec<u128> = shifts.iter().map(|shift| x.mul_wide_shr(y, *shift)).collect();
+        assert_eq!(output, to_words(&expected), "carry through product limb 2");
     }
 }
