@@ -573,7 +573,8 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         ExecutionMode::Interpreted
     };
     let mut call_frames = match execution_mode {
-        ExecutionMode::Jit => vec![],
+        // None of these use the call frame buffer.
+        ExecutionMode::Jit | ExecutionMode::ParrotInterpreted | ExecutionMode::ParrotJit => vec![],
         ExecutionMode::Interpreted | ExecutionMode::PreferJit => {
             vec![CallFrame::default(); verified_executable.get_config().max_call_depth]
         }

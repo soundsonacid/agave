@@ -34,7 +34,7 @@ use {
         memory_region::MemoryMapping,
         profiler::CuProfiler,
         program::{BuiltinProgram, SBPFVersion},
-        vm::{Config, ContextObject, EbpfVm},
+        vm::{Config, ContextObject, EbpfVm, ExecutionMode},
     },
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
@@ -248,6 +248,8 @@ pub struct InvokeContext<'a, 'ix_data> {
     #[cfg(feature = "sbpf-debugger")]
     pub debug_port: Option<u16>,
     pub cu_profiler: Option<CuProfiler>,
+    /// How SBF programs are executed, CPI callees included. `PreferJit` unless set otherwise.
+    pub execution_mode: ExecutionMode,
 }
 
 impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
@@ -273,6 +275,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             #[cfg(feature = "sbpf-debugger")]
             debug_port: None,
             cu_profiler: None,
+            execution_mode: ExecutionMode::PreferJit,
         }
     }
 

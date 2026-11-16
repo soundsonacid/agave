@@ -284,7 +284,9 @@ pub fn execute<'a, 'b: 'a>(
     };
 
     let execution_result = {
-        let mut execution_mode = ExecutionMode::PreferJit;
+        // The debugger and the CU profiler below only work in the legacy interpreter, so they
+        // take precedence over the requested mode.
+        let mut execution_mode = invoke_context.execution_mode;
 
         #[cfg(feature = "sbpf-debugger")]
         if invoke_context.debug_port.is_some() {
@@ -293,6 +295,31 @@ pub fn execute<'a, 'b: 'a>(
 
         if invoke_context.cu_profiler.is_some() {
             execution_mode = ExecutionMode::Interpreted;
+        }
+
+        // An executable holds the output of one JIT at a time (the legacy JIT's from loading), so
+        // recompile if the requested mode needs the other one.
+        #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+        {
+            let compiled_by_parrot = executable
+                .get_compiled_program()
+                .map(|program| program.is_parrot());
+            let recompiled = match (execution_mode, compiled_by_parrot) {
+                (ExecutionMode::ParrotJit, Some(false) | None) => executable.parrot_compile(),
+                (ExecutionMode::Jit | ExecutionMode::PreferJit, Some(true)) => {
+                    executable.jit_compile()
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = recompiled {
+                ic_logger_msg!(
+                    log_collector,
+                    "Failed to compile for {:?}: {}",
+                    execution_mode,
+                    e
+                );
+                return Err(Box::new(InstructionError::ProgramEnvironmentSetupFailure));
+            }
         }
 
         let compute_meter_prev = invoke_context.get_remaining();
@@ -376,8 +403,12 @@ pub fn execute<'a, 'b: 'a>(
         let this_call_us = this_call_ns / 1000;
         invoke_context.timings.execute_us += this_call_us;
         match execution_mode {
-            ExecutionMode::Interpreted => cache_entry.stats.interpreter_executed(this_call_us),
-            ExecutionMode::Jit => cache_entry.stats.jit_executed(this_call_us),
+            ExecutionMode::Interpreted | ExecutionMode::ParrotInterpreted => {
+                cache_entry.stats.interpreter_executed(this_call_us)
+            }
+            ExecutionMode::Jit | ExecutionMode::ParrotJit => {
+                cache_entry.stats.jit_executed(this_call_us)
+            }
             ExecutionMode::PreferJit => { /* not actually executed? */ }
         }
 
