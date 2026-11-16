@@ -10422,6 +10422,7 @@ checksum = "dcf09694a0fc14e5ffb18f9b7b7c0f15ecb6eac5b5610bf76a1853459d19daf9"
 [[package]]
 name = "solana-sbpf"
 version = "0.28.0"
+source = "git+https://github.com/soundsonacid/sbpf?rev=c782efaed560b9845befa7e61f1697bc1a37a8ba#c782efaed560b9845befa7e61f1697bc1a37a8ba"
 dependencies = [
  "byteorder",
  "combine 3.8.1",
